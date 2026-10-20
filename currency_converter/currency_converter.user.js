@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         选中价格快捷汇率转换
 // @namespace    deservel.currency.converter
-// @version      1.3.0
-// @description  选中网页价格后可按 Alt+C 或悬停划词圆点换算；支持币种识别、网站记忆、汇率缓存与多接口兜底。
+// @version      1.6.0
+// @description  鼠标选中任意文字后松开显示小圆点，悬停尝试换算；同时支持 Alt+C、币种纠正、网站记忆与汇率缓存。
 // @author       DeserveL
 // @match        http://*/*
 // @match        https://*/*
@@ -27,7 +27,10 @@
         defaultDollarCurrency: 'USD',
         defaultYenCurrency: 'JPY',
         maxSelectionLength: 100,
-        hoverDotEnabled: true,    // 选中金额后出现划词换算圆点，鼠标悬停触发
+        hoverDotEnabled: true,
+        hoverDotSize: 18,          // 小圆点直径（像素）
+        hoverDotOffsetX: -30,     // 选区左侧偏移，减少与沉浸式翻译图标重合
+        hoverDotOffsetY: 10,      // 选区底部偏移
     };
 
     const STORAGE_KEYS = {
@@ -104,221 +107,62 @@
     let popupEl = null;
     let popupTimer = null;
     let conversionSequence = 0;
-    let hoverDotEl = null;
-    let hoverDotSelection = null;
-    let selectionUpdateTimer = null;
-    let overlayHost = null;
-    let overlayRoot = null;
-    let hoverDotKey = null;
-    let lastTriggeredSelectionKey = null;
-    let activePopupSelectionKey = null;
+    let dotHost = null;
+    let dotButton = null;
+    let dotSelection = null;
+    let dotReleaseTimer = null;
     let lastMouse = { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
 
     document.addEventListener('mousemove', (event) => {
         lastMouse = { x: event.clientX, y: event.clientY };
     }, { passive: true });
 
-    ensureOverlayRoot();
     injectStyles();
 
-    // 普通鼠标划选：等鼠标释放后、选区稳定再显示圆点。
-    document.addEventListener('mouseup', (event) => {
-        if (event.button !== 0 || isScriptUiTarget(event)) return;
-        scheduleHoverDotUpdate(30);
-    }, true);
-
-    // 某些站点在 mouseup 之后才更新选区，selectionchange 作为兜底。
-    document.addEventListener('selectionchange', () => scheduleHoverDotUpdate(80), true);
-    document.addEventListener('pointerup', (event) => {
-        if (event.pointerType === 'mouse' || isScriptUiTarget(event)) return;
-        scheduleHoverDotUpdate(120);
-    }, true);
-    document.addEventListener('touchend', () => scheduleHoverDotUpdate(150), true);
-    document.addEventListener('dblclick', (event) => {
-        if (!isScriptUiTarget(event)) scheduleHoverDotUpdate(50);
-    }, true);
-
-    // 键盘 Shift+方向键选中文字。
-    document.addEventListener('keyup', (event) => {
-        if (event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
-            scheduleHoverDotUpdate(60);
-        }
-    }, true);
-
-    document.addEventListener('mousedown', (event) => {
-        if (!isScriptUiTarget(event)) hideHoverDot();
-    }, true);
-    document.addEventListener('scroll', hideHoverDot, true);
-    window.addEventListener('resize', hideHoverDot, { passive: true });
+    // 只在释放鼠标后出现圆点；不通过金额、货币符号等条件预先过滤。
+    // window 捕获阶段提高在 Discourse / 动态论坛上的事件兼容性。
+    if (CONFIG.hoverDotEnabled) {
+        window.addEventListener('pointerdown', dismissDot, true);
+        window.addEventListener('mousedown', dismissDot, true);
+        window.addEventListener('mouseup', onMouseRelease, true);
+        // pointerup 作为兼容备用；mouseup 和 pointerup 共用一个短定时器避免重复创建。
+        window.addEventListener('pointerup', onPointerRelease, true);
+        window.addEventListener('scroll', dismissDot, true);
+        window.addEventListener('resize', dismissDot, true);
+    }
 
     document.addEventListener('keydown', (event) => {
-        if (event.key === 'Escape') {
-            hideHoverDot();
-            removePopup();
-            return;
-        }
         if (!matchesHotkey(event)) return;
 
         event.preventDefault();
         event.stopPropagation();
-        const selected = getSelectedContent();
-        if (selected.text) lastTriggeredSelectionKey = selectionKey(selected);
-        hideHoverDot();
-        triggerConversion(selected, true);
+        dismissDot();
+        void convertSelection(getSelectedContent());
     }, true);
 
-    function isScriptUiTarget(event) {
-        const target = event && event.target ? event.target : event;
-        if (target === overlayHost) return true;
-        if (!(target instanceof Element)) return false;
-        if (target.closest('.fxc-popup, .fxc-hover-dot, #fxc-overlay-host')) return true;
-        const path = event && typeof event.composedPath === 'function' ? event.composedPath() : [];
-        return path.includes(overlayHost);
-    }
-
-    function selectionKey(selected) {
-        if (!selected || !selected.text) return '';
-        const r = selected.rect || {};
-        return `${selected.text}|${Math.round(r.left || 0)},${Math.round(r.top || 0)},${Math.round(r.right || 0)},${Math.round(r.bottom || 0)}`;
-    }
-
-    function scheduleHoverDotUpdate(delay = 60) {
-        if (!CONFIG.hoverDotEnabled) return;
-        clearTimeout(selectionUpdateTimer);
-        selectionUpdateTimer = window.setTimeout(() => {
-            selectionUpdateTimer = null;
-            const selected = getSelectedContent();
-            if (!isLikelyPriceSelection(selected)) {
-                hideHoverDot();
-                lastTriggeredSelectionKey = null;
-                return;
-            }
-            const key = selectionKey(selected);
-            // 同一选区只悬停触发一次；也不重复创建已有圆点。
-            if (key === lastTriggeredSelectionKey) return;
-            if (key === hoverDotKey && hoverDotEl && hoverDotEl.isConnected) return;
-            if (key === activePopupSelectionKey && popupEl && popupEl.isConnected) return;
-            showHoverDot(selected);
-        }, delay);
-    }
-
-    // 圆点只针对“金额形态”的选区，防止选普通文章文字时频繁出现。
-    // 单独选中纯整数（如年份 2026）时不提示；Alt+C 仍可照常手动换算。
-    function isLikelyPriceSelection(selected) {
-        const value = selected && selected.text;
-        if (!value || value.length > CONFIG.maxSelectionLength) return false;
-        if (!Number.isFinite(parseAmount(value))) return false;
-
-        // 必须是一个金额：去掉币种标识、金额和常规标点后不能剩下文字。
-        const currencyMarker = /(?:\b(?:USD|CNY|RMB|EUR|GBP|JPY|HKD|CAD|AUD|SGD|NZD|KRW|INR|CHF|TWD|THB|MYR|PHP|VND|IDR|BRL|MXN|RM|Rp)\b)|[€£$¥￥₩₹฿₱₫]/i;
-        const marked = currencyMarker.test(value);
-        const digits = value.match(/\d[\d\s.,'’]*/g) || [];
-        if (digits.length !== 1) return false;
-        const remainder = value
-            .replace(/\b(?:USD|CNY|RMB|EUR|GBP|JPY|HKD|CAD|AUD|SGD|NZD|KRW|INR|CHF|TWD|THB|MYR|PHP|VND|IDR|BRL|MXN|RM|Rp)\b/gi, '')
-            .replace(/(?:US|CA|AU|HK|SG|NZ|CN|JP|NT|MX|C|A|S|R)\s*(?=[$¥￥])/gi, '')
-            .replace(/[€£$¥￥₩₹฿₱₫]/g, '')
-            .replace(/[\d\s.,'’()+\-−–—]/g, '');
-        // 很多网站复制出来的选区会附带“售价:”、“起”或“/month”等极短文字。
-        // 仅在明确存在货币符号/代码时允许这些包装语，避免把普通文字误认作价格。
-        const wrapper = remainder.trim()
-            .replace(/^(?:价格|售价|现价|原价|到手价|price|total|from|sale|now)[:：\s]*/i, '')
-            .replace(/(?:起|元|每月|每年|\/\s*(?:mo(?:nth)?|yr|year|月|年)|(?:inc|excl)\.?\s*(?:tax|vat))$/i, '')
-            .trim();
-        if (wrapper) return false;
-
-        if (marked) return true;
-        const bareNumber = value.trim();
-        // 支持直接选中 22.63 / 1,299.99 等金额；不对任意整数弹出圆点。
-        if (/^[-+]?\d[\d\s,'’]*[.,]\d{1,2}$/.test(bareNumber)) return true;
-        if (/^[-+]?\d{1,3}(?:[,.\s]\d{3})+(?:[.,]\d{2})?$/.test(bareNumber)) return true;
-        return hasPriceElementHint(selected.element);
-    }
-
-    function hasPriceElementHint(element) {
-        let current = element;
-        for (let depth = 0; current && depth < 3; depth++, current = current.parentElement) {
-            const text = `${current.id || ''} ${String(current.className || '')}`;
-            if (/(?:price|amount|cost|money|currency|售价|价格|金额)/i.test(text)) return true;
-            if (current.hasAttribute && (current.hasAttribute('data-price') || current.hasAttribute('itemprop') && current.getAttribute('itemprop') === 'price')) return true;
-        }
-        return false;
-    }
-
-    function showHoverDot(selected) {
-        hideHoverDot();
-        // 用户划选了新价格，就不让旧价格的浮窗遮挡当前选区。
-        removePopup();
-        hoverDotSelection = selected;
-        hoverDotKey = selectionKey(selected);
-
-        const dot = document.createElement('button');
-        dot.type = 'button';
-        dot.className = 'fxc-hover-dot';
-        dot.textContent = '¥';
-        dot.title = '移到这里换算汇率（也可按 Alt+C）';
-        dot.setAttribute('aria-label', '悬停转换选中金额');
-        dot.addEventListener('mousedown', (event) => event.preventDefault());
-        dot.addEventListener('mouseenter', activateHoverDot);
-        dot.addEventListener('focus', activateHoverDot);
-        hoverDotEl = dot;
-        // Shadow DOM 隔离：避免购物网站自身 CSS 或旧版 CSS 覆盖圆点样式。
-        ensureOverlayRoot().appendChild(dot);
-        positionHoverDot(dot, selected.rect);
-    }
-
-    function positionHoverDot(dot, rect) {
-        const margin = 6;
-        const size = 24;
-        const right = rect && Number.isFinite(rect.right) ? rect.right : lastMouse.x;
-        const topEdge = rect && Number.isFinite(rect.top) ? rect.top : lastMouse.y;
-        const bottom = rect && Number.isFinite(rect.bottom) ? rect.bottom : lastMouse.y;
-        // 优先放在选区的右下角；右侧空间不足时放到选区左侧。
-        let left = right + 7;
-        if (left + size > window.innerWidth - margin) {
-            left = Math.max(margin, (rect && Number.isFinite(rect.left) ? rect.left : right) - size - 7);
-        }
-        const top = Math.max(margin, Math.min(window.innerHeight - size - margin, bottom - size / 2));
-        dot.style.left = `${Math.round(Math.max(margin, left))}px`;
-        dot.style.top = `${Math.round(top)}px`;
-    }
-
-    function activateHoverDot() {
-        const selected = hoverDotSelection;
-        lastTriggeredSelectionKey = selectionKey(selected);
-        hideHoverDot();
-        if (selected) triggerConversion(selected, false);
-    }
-
-    function hideHoverDot() {
-        if (hoverDotEl) {
-            hoverDotEl.remove();
-            hoverDotEl = null;
-        }
-        hoverDotSelection = null;
-        hoverDotKey = null;
-    }
-
-    function triggerConversion(selected, showErrors) {
+    async function convertSelection(selected) {
         if (!selected.text) {
-            if (showErrors) showMessagePopup(selected.rect, '请先选中一个价格');
+            showMessagePopup(selected.rect, '请先选中一个价格');
             return;
         }
+
         if (selected.text.length > CONFIG.maxSelectionLength) {
-            if (showErrors) showMessagePopup(selected.rect, '选中内容过长，请只选择价格');
+            showMessagePopup(selected.rect, '选中内容过长，请只选择价格');
             return;
         }
+
         const amount = parseAmount(selected.text);
         if (!Number.isFinite(amount)) {
-            if (showErrors) showMessagePopup(selected.rect, '未识别到有效金额');
+            showMessagePopup(selected.rect, '未识别到有效金额');
             return;
         }
+
         const detected = detectCurrency(selected.text, selected.element);
         if (!detected || !detected.code) {
-            if (showErrors) showMessagePopup(selected.rect, '无法识别币种');
+            showMessagePopup(selected.rect, '无法识别币种');
             return;
         }
-        activePopupSelectionKey = selectionKey(selected);
+
         const state = {
             rect: selected.rect,
             sourceText: selected.text,
@@ -335,7 +179,104 @@
             provider: null,
             error: null,
         };
-        void convertAndRender(state);
+
+        await convertAndRender(state);
+    }
+
+    function onMouseRelease(event) {
+        if (event.button !== 0 || isOurUI(event.target)) return;
+        scheduleSelectionDot();
+    }
+
+    function onPointerRelease(event) {
+        if (event.pointerType === 'mouse' || event.pointerType === 'touch' || event.pointerType === 'pen') {
+            if (!isOurUI(event.target)) scheduleSelectionDot();
+        }
+    }
+
+    function isOurUI(target) {
+        return !!(target && (
+            (popupEl && popupEl.contains(target)) ||
+            (dotHost && dotHost.contains(target))
+        ));
+    }
+
+    function dismissDot() {
+        if (dotReleaseTimer !== null) {
+            clearTimeout(dotReleaseTimer);
+            dotReleaseTimer = null;
+        }
+        dotSelection = null;
+        if (dotHost) {
+            dotHost.remove();
+            dotHost = null;
+            dotButton = null;
+        }
+    }
+
+    function scheduleSelectionDot() {
+        if (dotReleaseTimer !== null) clearTimeout(dotReleaseTimer);
+        // 先等待浏览器完成选区更新，避免拖选过程中的 selectionchange 误触发。
+        dotReleaseTimer = window.setTimeout(() => {
+            dotReleaseTimer = null;
+            const selected = getSelectedContent();
+            if (!selected.text) {
+                dismissDot();
+                return;
+            }
+            showSelectionDot(selected);
+        }, 35);
+    }
+
+    function showSelectionDot(selected) {
+        dismissDot();
+        dotSelection = selected; // 快照：即使随后网页清掉高亮，也能正确换算
+        const host = document.createElement('div');
+        host.id = 'fxc-simple-hover-dot-host';
+        // Shadow DOM 隔离论坛主题、插件或全局按钮样式。
+        host.style.cssText = 'all:initial!important;position:fixed!important;z-index:2147483647!important;width:18px!important;height:18px!important;display:block!important;overflow:visible!important;pointer-events:auto!important;';
+        const shadow = host.attachShadow({ mode: 'open' });
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.setAttribute('aria-label', '悬停换算选中文字');
+        button.title = '悬停换算为人民币';
+        button.textContent = '¥';
+        button.style.cssText = [
+            'all:initial!important',
+            'display:flex!important',
+            'align-items:center!important',
+            'justify-content:center!important',
+            'box-sizing:border-box!important',
+            'width:100%!important',
+            'height:100%!important',
+            'border:1px solid #fff!important',
+            'border-radius:50%!important',
+            'background:#2868dc!important',
+            'color:#fff!important',
+            'font:bold 12px Arial,sans-serif!important',
+            'line-height:1!important',
+            'cursor:pointer!important',
+            'box-shadow:0 2px 7px rgba(0,0,0,.30)!important',
+        ].join(';');
+        shadow.appendChild(button);
+        document.documentElement.appendChild(host);
+        dotHost = host;
+        dotButton = button;
+
+        const rect = selected.rect || fallbackRect();
+        const size = CONFIG.hoverDotSize;
+        host.style.setProperty('width', `${size}px`, 'important');
+        host.style.setProperty('height', `${size}px`, 'important');
+        const x = Math.max(6, Math.min(window.innerWidth - size - 6, rect.left + CONFIG.hoverDotOffsetX));
+        const y = Math.max(6, Math.min(window.innerHeight - size - 6, rect.bottom + CONFIG.hoverDotOffsetY));
+        host.style.setProperty('left', `${Math.round(x)}px`, 'important');
+        host.style.setProperty('top', `${Math.round(y)}px`, 'important');
+
+        button.addEventListener('mouseenter', () => {
+            const snapshot = dotSelection;
+            dismissDot();
+            if (snapshot) void convertSelection(snapshot);
+        }, { once: true });
     }
 
     function matchesHotkey(event) {
@@ -911,13 +852,13 @@
     }
 
     function ensurePopup() {
-        if (popupEl && popupEl.isConnected) return popupEl;
+        if (popupEl && document.documentElement.contains(popupEl)) return popupEl;
 
         popupEl = document.createElement('div');
         popupEl.className = 'fxc-popup';
         popupEl.setAttribute('role', 'status');
         popupEl.addEventListener('click', event => event.stopPropagation());
-        ensureOverlayRoot().appendChild(popupEl);
+        document.documentElement.appendChild(popupEl);
         return popupEl;
     }
 
@@ -1000,14 +941,12 @@
     }
 
     function removePopup() {
-        // 关闭也会让尚未完成的汇率请求失效，防止旧弹窗重新出现。
-        conversionSequence++;
+        conversionSequence++; // 点击 × 后，不允许异步汇率请求把已关闭的弹窗重新打开
         clearPopupTimer();
         if (popupEl) {
             popupEl.remove();
             popupEl = null;
         }
-        activePopupSelectionKey = null;
     }
 
     function getStoredObject(key, fallback) {
@@ -1026,65 +965,12 @@
         GM_setValue(key, JSON.stringify(value));
     }
 
-    function ensureOverlayRoot() {
-        if (overlayHost && overlayHost.isConnected && overlayRoot) return overlayRoot;
-        overlayHost = document.createElement('div');
-        overlayHost.id = 'fxc-overlay-host';
-        // pointer-events:none 使透明图层不拦截网页操作；子元素单独开启交互。
-        const st = overlayHost.style;
-        st.setProperty('all', 'initial', 'important');
-        st.setProperty('position', 'fixed', 'important');
-        st.setProperty('top', '0', 'important');
-        st.setProperty('left', '0', 'important');
-        st.setProperty('width', '100vw', 'important');
-        st.setProperty('height', '100vh', 'important');
-        st.setProperty('margin', '0', 'important');
-        st.setProperty('padding', '0', 'important');
-        st.setProperty('pointer-events', 'none', 'important');
-        st.setProperty('z-index', '2147483647', 'important');
-        overlayRoot = overlayHost.attachShadow({ mode: 'open' });
-        document.documentElement.appendChild(overlayHost);
-        return overlayRoot;
-    }
-
     function injectStyles() {
-        const root = ensureOverlayRoot();
-        if (root.querySelector('#fxc-style-v13')) return;
+        if (document.getElementById('fxc-style')) return;
         const style = document.createElement('style');
-        style.id = 'fxc-style-v13';
+        style.id = 'fxc-style';
         style.textContent = `
-            .fxc-hover-dot {
-                pointer-events: auto !important;
-                position: fixed !important;
-                z-index: 2147483646 !important;
-                display: flex !important;
-                align-items: center !important;
-                justify-content: center !important;
-                width: 24px !important;
-                height: 24px !important;
-                min-width: 24px !important;
-                min-height: 24px !important;
-                margin: 0 !important;
-                padding: 0 !important;
-                border: 1px solid rgba(255, 255, 255, .95) !important;
-                border-radius: 50% !important;
-                background: #2869e8 !important;
-                color: #fff !important;
-                box-shadow: 0 3px 12px rgba(0, 0, 0, .28) !important;
-                font-family: Arial, sans-serif !important;
-                font-weight: 700 !important;
-                font-size: 13px !important;
-                line-height: 1 !important;
-                cursor: pointer !important;
-                user-select: none !important;
-            }
-            .fxc-hover-dot:hover, .fxc-hover-dot:focus-visible {
-                background: #164ba9 !important;
-                transform: scale(1.08) !important;
-                outline: 2px solid #b1c9ff !important;
-            }
             .fxc-popup {
-                pointer-events: auto !important;
                 position: fixed !important;
                 z-index: 2147483647 !important;
                 min-width: 230px !important;
@@ -1233,6 +1119,6 @@
                 color: #555 !important;
             }
         `;
-        root.appendChild(style);
+        document.documentElement.appendChild(style);
     }
 })();
