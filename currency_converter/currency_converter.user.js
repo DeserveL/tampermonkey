@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         选中价格快捷汇率转换
 // @namespace    deservel.currency.converter
-// @version      1.0.1
-// @description  选中网页价格后按 Alt+C，在选中文字附近快速换算为指定货币；支持币种识别、网站记忆、汇率缓存与多接口兜底。
+// @version      1.2.0
+// @description  选中网页价格后可按 Alt+C 或悬停划词圆点换算；支持币种识别、网站记忆、汇率缓存与多接口兜底。
 // @author       DeserveL
 // @match        http://*/*
 // @match        https://*/*
@@ -27,6 +27,7 @@
         defaultDollarCurrency: 'USD',
         defaultYenCurrency: 'JPY',
         maxSelectionLength: 100,
+        hoverDotEnabled: true,    // 选中金额后出现划词换算圆点，鼠标悬停触发
     };
 
     const STORAGE_KEYS = {
@@ -103,6 +104,9 @@
     let popupEl = null;
     let popupTimer = null;
     let conversionSequence = 0;
+    let hoverDotEl = null;
+    let hoverDotSelection = null;
+    let selectionUpdateTimer = null;
     let lastMouse = { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
 
     document.addEventListener('mousemove', (event) => {
@@ -111,35 +115,163 @@
 
     injectStyles();
 
-    document.addEventListener('keydown', async (event) => {
+    // 划词模式：鼠标松开后再读取选区，避免拖拽过程中不断出现小圆点。
+    document.addEventListener('mouseup', (event) => {
+        if (event.button !== 0 || isScriptUiTarget(event.target)) return;
+        scheduleHoverDotUpdate();
+    }, true);
+
+    // 兼容 Shift + 方向键等键盘方式选中文字。
+    document.addEventListener('keyup', (event) => {
+        if (event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+            scheduleHoverDotUpdate();
+        }
+    }, true);
+
+    document.addEventListener('mousedown', (event) => {
+        if (!isScriptUiTarget(event.target)) hideHoverDot();
+    }, true);
+    document.addEventListener('scroll', hideHoverDot, true);
+    window.addEventListener('resize', hideHoverDot, { passive: true });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            hideHoverDot();
+            removePopup();
+            return;
+        }
         if (!matchesHotkey(event)) return;
 
         event.preventDefault();
         event.stopPropagation();
+        hideHoverDot();
+        triggerConversion(getSelectedContent(), true);
+    }, true);
 
-        const selected = getSelectedContent();
+    function isScriptUiTarget(target) {
+        return target instanceof Element && !!target.closest('.fxc-popup, .fxc-hover-dot');
+    }
+
+    function scheduleHoverDotUpdate() {
+        if (!CONFIG.hoverDotEnabled) return;
+        clearTimeout(selectionUpdateTimer);
+        selectionUpdateTimer = window.setTimeout(() => {
+            selectionUpdateTimer = null;
+            const selected = getSelectedContent();
+            if (!isLikelyPriceSelection(selected)) {
+                hideHoverDot();
+                return;
+            }
+            showHoverDot(selected);
+        }, 0);
+    }
+
+    // 圆点只针对“金额形态”的选区，防止选普通文章文字时频繁出现。
+    // 单独选中纯整数（如年份 2026）时不提示；Alt+C 仍可照常手动换算。
+    function isLikelyPriceSelection(selected) {
+        const value = selected && selected.text;
+        if (!value || value.length > CONFIG.maxSelectionLength) return false;
+        if (!Number.isFinite(parseAmount(value))) return false;
+
+        // 必须是一个金额：去掉币种标识、金额和常规标点后不能剩下文字。
+        const currencyMarker = /(?:\b(?:USD|CNY|RMB|EUR|GBP|JPY|HKD|CAD|AUD|SGD|NZD|KRW|INR|CHF|TWD|THB|MYR|PHP|VND|IDR|BRL|MXN|RM|Rp)\b)|[€£$¥￥₩₹฿₱₫]/i;
+        const marked = currencyMarker.test(value);
+        const digits = value.match(/\d[\d\s.,'’]*/g) || [];
+        if (digits.length !== 1) return false;
+        const remainder = value
+            .replace(/\b(?:USD|CNY|RMB|EUR|GBP|JPY|HKD|CAD|AUD|SGD|NZD|KRW|INR|CHF|TWD|THB|MYR|PHP|VND|IDR|BRL|MXN|RM|Rp)\b/gi, '')
+            .replace(/(?:US|CA|AU|HK|SG|NZ|CN|JP|NT|MX|C|A|S|R)\s*(?=[$¥￥])/gi, '')
+            .replace(/[€£$¥￥₩₹฿₱₫]/g, '')
+            .replace(/[\d\s.,'’()+\-−–—]/g, '');
+        if (remainder.trim()) return false;
+
+        if (marked) return true;
+        const bareNumber = value.trim();
+        // 支持直接选中 22.63 / 1,299.99 等金额；不对任意整数弹出圆点。
+        if (/^[-+]?\d[\d\s,'’]*[.,]\d{1,2}$/.test(bareNumber)) return true;
+        if (/^[-+]?\d{1,3}(?:[,.\s]\d{3})+(?:[.,]\d{2})?$/.test(bareNumber)) return true;
+        return hasPriceElementHint(selected.element);
+    }
+
+    function hasPriceElementHint(element) {
+        let current = element;
+        for (let depth = 0; current && depth < 3; depth++, current = current.parentElement) {
+            const text = `${current.id || ''} ${String(current.className || '')}`;
+            if (/(?:price|amount|cost|money|currency|售价|价格|金额)/i.test(text)) return true;
+            if (current.hasAttribute && (current.hasAttribute('data-price') || current.hasAttribute('itemprop') && current.getAttribute('itemprop') === 'price')) return true;
+        }
+        return false;
+    }
+
+    function showHoverDot(selected) {
+        hideHoverDot();
+        // 用户划选了新价格，就不让旧价格的浮窗遮挡当前选区。
+        removePopup();
+        hoverDotSelection = selected;
+
+        const dot = document.createElement('button');
+        dot.type = 'button';
+        dot.className = 'fxc-hover-dot';
+        dot.textContent = '¥';
+        dot.title = '移到这里换算汇率（也可按 Alt+C）';
+        dot.setAttribute('aria-label', '悬停转换选中金额');
+        dot.addEventListener('mousedown', (event) => event.preventDefault());
+        dot.addEventListener('mouseenter', activateHoverDot);
+        dot.addEventListener('focus', activateHoverDot);
+        hoverDotEl = dot;
+        document.documentElement.appendChild(dot);
+        positionHoverDot(dot, selected.rect);
+    }
+
+    function positionHoverDot(dot, rect) {
+        const margin = 6;
+        const size = 24;
+        const right = rect && Number.isFinite(rect.right) ? rect.right : lastMouse.x;
+        const topEdge = rect && Number.isFinite(rect.top) ? rect.top : lastMouse.y;
+        const bottom = rect && Number.isFinite(rect.bottom) ? rect.bottom : lastMouse.y;
+        // 优先放在选区的右下角；右侧空间不足时放到选区左侧。
+        let left = right + 7;
+        if (left + size > window.innerWidth - margin) {
+            left = Math.max(margin, (rect && Number.isFinite(rect.left) ? rect.left : right) - size - 7);
+        }
+        const top = Math.max(margin, Math.min(window.innerHeight - size - margin, bottom - size / 2));
+        dot.style.left = `${Math.round(Math.max(margin, left))}px`;
+        dot.style.top = `${Math.round(top)}px`;
+    }
+
+    function activateHoverDot() {
+        const selected = hoverDotSelection;
+        hideHoverDot();
+        if (selected) triggerConversion(selected, false);
+    }
+
+    function hideHoverDot() {
+        if (hoverDotEl) {
+            hoverDotEl.remove();
+            hoverDotEl = null;
+        }
+        hoverDotSelection = null;
+    }
+
+    function triggerConversion(selected, showErrors) {
         if (!selected.text) {
-            showMessagePopup(selected.rect, '请先选中一个价格');
+            if (showErrors) showMessagePopup(selected.rect, '请先选中一个价格');
             return;
         }
-
         if (selected.text.length > CONFIG.maxSelectionLength) {
-            showMessagePopup(selected.rect, '选中内容过长，请只选择价格');
+            if (showErrors) showMessagePopup(selected.rect, '选中内容过长，请只选择价格');
             return;
         }
-
         const amount = parseAmount(selected.text);
         if (!Number.isFinite(amount)) {
-            showMessagePopup(selected.rect, '未识别到有效金额');
+            if (showErrors) showMessagePopup(selected.rect, '未识别到有效金额');
             return;
         }
-
         const detected = detectCurrency(selected.text, selected.element);
         if (!detected || !detected.code) {
-            showMessagePopup(selected.rect, '无法识别币种');
+            if (showErrors) showMessagePopup(selected.rect, '无法识别币种');
             return;
         }
-
         const state = {
             rect: selected.rect,
             sourceText: selected.text,
@@ -156,9 +288,8 @@
             provider: null,
             error: null,
         };
-
-        await convertAndRender(state);
-    }, true);
+        void convertAndRender(state);
+    }
 
     function matchesHotkey(event) {
         return event.altKey === CONFIG.hotkey.alt &&
@@ -822,6 +953,8 @@
     }
 
     function removePopup() {
+        // 关闭也会让尚未完成的汇率请求失效，防止旧弹窗重新出现。
+        conversionSequence++;
         clearPopupTimer();
         if (popupEl) {
             popupEl.remove();
@@ -850,6 +983,35 @@
         const style = document.createElement('style');
         style.id = 'fxc-style';
         style.textContent = `
+            .fxc-hover-dot {
+                position: fixed !important;
+                z-index: 2147483646 !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                width: 24px !important;
+                height: 24px !important;
+                min-width: 24px !important;
+                min-height: 24px !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 1px solid rgba(255, 255, 255, .95) !important;
+                border-radius: 50% !important;
+                background: #2869e8 !important;
+                color: #fff !important;
+                box-shadow: 0 3px 12px rgba(0, 0, 0, .28) !important;
+                font-family: Arial, sans-serif !important;
+                font-weight: 700 !important;
+                font-size: 13px !important;
+                line-height: 1 !important;
+                cursor: pointer !important;
+                user-select: none !important;
+            }
+            .fxc-hover-dot:hover, .fxc-hover-dot:focus-visible {
+                background: #164ba9 !important;
+                transform: scale(1.08) !important;
+                outline: 2px solid #b1c9ff !important;
+            }
             .fxc-popup {
                 position: fixed !important;
                 z-index: 2147483647 !important;
