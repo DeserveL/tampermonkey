@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         选中价格快捷汇率转换
 // @namespace    deservel.currency.converter
-// @version      1.2.0
+// @version      1.3.0
 // @description  选中网页价格后可按 Alt+C 或悬停划词圆点换算；支持币种识别、网站记忆、汇率缓存与多接口兜底。
 // @author       DeserveL
 // @match        http://*/*
@@ -107,29 +107,46 @@
     let hoverDotEl = null;
     let hoverDotSelection = null;
     let selectionUpdateTimer = null;
+    let overlayHost = null;
+    let overlayRoot = null;
+    let hoverDotKey = null;
+    let lastTriggeredSelectionKey = null;
+    let activePopupSelectionKey = null;
     let lastMouse = { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
 
     document.addEventListener('mousemove', (event) => {
         lastMouse = { x: event.clientX, y: event.clientY };
     }, { passive: true });
 
+    ensureOverlayRoot();
     injectStyles();
 
-    // 划词模式：鼠标松开后再读取选区，避免拖拽过程中不断出现小圆点。
+    // 普通鼠标划选：等鼠标释放后、选区稳定再显示圆点。
     document.addEventListener('mouseup', (event) => {
-        if (event.button !== 0 || isScriptUiTarget(event.target)) return;
-        scheduleHoverDotUpdate();
+        if (event.button !== 0 || isScriptUiTarget(event)) return;
+        scheduleHoverDotUpdate(30);
     }, true);
 
-    // 兼容 Shift + 方向键等键盘方式选中文字。
+    // 某些站点在 mouseup 之后才更新选区，selectionchange 作为兜底。
+    document.addEventListener('selectionchange', () => scheduleHoverDotUpdate(80), true);
+    document.addEventListener('pointerup', (event) => {
+        if (event.pointerType === 'mouse' || isScriptUiTarget(event)) return;
+        scheduleHoverDotUpdate(120);
+    }, true);
+    document.addEventListener('touchend', () => scheduleHoverDotUpdate(150), true);
+    document.addEventListener('dblclick', (event) => {
+        if (!isScriptUiTarget(event)) scheduleHoverDotUpdate(50);
+    }, true);
+
+    // 键盘 Shift+方向键选中文字。
     document.addEventListener('keyup', (event) => {
         if (event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
-            scheduleHoverDotUpdate();
+            scheduleHoverDotUpdate(60);
         }
     }, true);
 
     document.addEventListener('mousedown', (event) => {
-        if (!isScriptUiTarget(event.target)) hideHoverDot();
+        if (!isScriptUiTarget(event)) hideHoverDot();
     }, true);
     document.addEventListener('scroll', hideHoverDot, true);
     window.addEventListener('resize', hideHoverDot, { passive: true });
@@ -144,15 +161,28 @@
 
         event.preventDefault();
         event.stopPropagation();
+        const selected = getSelectedContent();
+        if (selected.text) lastTriggeredSelectionKey = selectionKey(selected);
         hideHoverDot();
-        triggerConversion(getSelectedContent(), true);
+        triggerConversion(selected, true);
     }, true);
 
-    function isScriptUiTarget(target) {
-        return target instanceof Element && !!target.closest('.fxc-popup, .fxc-hover-dot');
+    function isScriptUiTarget(event) {
+        const target = event && event.target ? event.target : event;
+        if (target === overlayHost) return true;
+        if (!(target instanceof Element)) return false;
+        if (target.closest('.fxc-popup, .fxc-hover-dot, #fxc-overlay-host')) return true;
+        const path = event && typeof event.composedPath === 'function' ? event.composedPath() : [];
+        return path.includes(overlayHost);
     }
 
-    function scheduleHoverDotUpdate() {
+    function selectionKey(selected) {
+        if (!selected || !selected.text) return '';
+        const r = selected.rect || {};
+        return `${selected.text}|${Math.round(r.left || 0)},${Math.round(r.top || 0)},${Math.round(r.right || 0)},${Math.round(r.bottom || 0)}`;
+    }
+
+    function scheduleHoverDotUpdate(delay = 60) {
         if (!CONFIG.hoverDotEnabled) return;
         clearTimeout(selectionUpdateTimer);
         selectionUpdateTimer = window.setTimeout(() => {
@@ -160,10 +190,16 @@
             const selected = getSelectedContent();
             if (!isLikelyPriceSelection(selected)) {
                 hideHoverDot();
+                lastTriggeredSelectionKey = null;
                 return;
             }
+            const key = selectionKey(selected);
+            // 同一选区只悬停触发一次；也不重复创建已有圆点。
+            if (key === lastTriggeredSelectionKey) return;
+            if (key === hoverDotKey && hoverDotEl && hoverDotEl.isConnected) return;
+            if (key === activePopupSelectionKey && popupEl && popupEl.isConnected) return;
             showHoverDot(selected);
-        }, 0);
+        }, delay);
     }
 
     // 圆点只针对“金额形态”的选区，防止选普通文章文字时频繁出现。
@@ -183,7 +219,13 @@
             .replace(/(?:US|CA|AU|HK|SG|NZ|CN|JP|NT|MX|C|A|S|R)\s*(?=[$¥￥])/gi, '')
             .replace(/[€£$¥￥₩₹฿₱₫]/g, '')
             .replace(/[\d\s.,'’()+\-−–—]/g, '');
-        if (remainder.trim()) return false;
+        // 很多网站复制出来的选区会附带“售价:”、“起”或“/month”等极短文字。
+        // 仅在明确存在货币符号/代码时允许这些包装语，避免把普通文字误认作价格。
+        const wrapper = remainder.trim()
+            .replace(/^(?:价格|售价|现价|原价|到手价|price|total|from|sale|now)[:：\s]*/i, '')
+            .replace(/(?:起|元|每月|每年|\/\s*(?:mo(?:nth)?|yr|year|月|年)|(?:inc|excl)\.?\s*(?:tax|vat))$/i, '')
+            .trim();
+        if (wrapper) return false;
 
         if (marked) return true;
         const bareNumber = value.trim();
@@ -208,6 +250,7 @@
         // 用户划选了新价格，就不让旧价格的浮窗遮挡当前选区。
         removePopup();
         hoverDotSelection = selected;
+        hoverDotKey = selectionKey(selected);
 
         const dot = document.createElement('button');
         dot.type = 'button';
@@ -219,7 +262,8 @@
         dot.addEventListener('mouseenter', activateHoverDot);
         dot.addEventListener('focus', activateHoverDot);
         hoverDotEl = dot;
-        document.documentElement.appendChild(dot);
+        // Shadow DOM 隔离：避免购物网站自身 CSS 或旧版 CSS 覆盖圆点样式。
+        ensureOverlayRoot().appendChild(dot);
         positionHoverDot(dot, selected.rect);
     }
 
@@ -241,6 +285,7 @@
 
     function activateHoverDot() {
         const selected = hoverDotSelection;
+        lastTriggeredSelectionKey = selectionKey(selected);
         hideHoverDot();
         if (selected) triggerConversion(selected, false);
     }
@@ -251,6 +296,7 @@
             hoverDotEl = null;
         }
         hoverDotSelection = null;
+        hoverDotKey = null;
     }
 
     function triggerConversion(selected, showErrors) {
@@ -272,6 +318,7 @@
             if (showErrors) showMessagePopup(selected.rect, '无法识别币种');
             return;
         }
+        activePopupSelectionKey = selectionKey(selected);
         const state = {
             rect: selected.rect,
             sourceText: selected.text,
@@ -864,13 +911,13 @@
     }
 
     function ensurePopup() {
-        if (popupEl && document.documentElement.contains(popupEl)) return popupEl;
+        if (popupEl && popupEl.isConnected) return popupEl;
 
         popupEl = document.createElement('div');
         popupEl.className = 'fxc-popup';
         popupEl.setAttribute('role', 'status');
         popupEl.addEventListener('click', event => event.stopPropagation());
-        document.documentElement.appendChild(popupEl);
+        ensureOverlayRoot().appendChild(popupEl);
         return popupEl;
     }
 
@@ -960,6 +1007,7 @@
             popupEl.remove();
             popupEl = null;
         }
+        activePopupSelectionKey = null;
     }
 
     function getStoredObject(key, fallback) {
@@ -978,12 +1026,35 @@
         GM_setValue(key, JSON.stringify(value));
     }
 
+    function ensureOverlayRoot() {
+        if (overlayHost && overlayHost.isConnected && overlayRoot) return overlayRoot;
+        overlayHost = document.createElement('div');
+        overlayHost.id = 'fxc-overlay-host';
+        // pointer-events:none 使透明图层不拦截网页操作；子元素单独开启交互。
+        const st = overlayHost.style;
+        st.setProperty('all', 'initial', 'important');
+        st.setProperty('position', 'fixed', 'important');
+        st.setProperty('top', '0', 'important');
+        st.setProperty('left', '0', 'important');
+        st.setProperty('width', '100vw', 'important');
+        st.setProperty('height', '100vh', 'important');
+        st.setProperty('margin', '0', 'important');
+        st.setProperty('padding', '0', 'important');
+        st.setProperty('pointer-events', 'none', 'important');
+        st.setProperty('z-index', '2147483647', 'important');
+        overlayRoot = overlayHost.attachShadow({ mode: 'open' });
+        document.documentElement.appendChild(overlayHost);
+        return overlayRoot;
+    }
+
     function injectStyles() {
-        if (document.getElementById('fxc-style')) return;
+        const root = ensureOverlayRoot();
+        if (root.querySelector('#fxc-style-v13')) return;
         const style = document.createElement('style');
-        style.id = 'fxc-style';
+        style.id = 'fxc-style-v13';
         style.textContent = `
             .fxc-hover-dot {
+                pointer-events: auto !important;
                 position: fixed !important;
                 z-index: 2147483646 !important;
                 display: flex !important;
@@ -1013,6 +1084,7 @@
                 outline: 2px solid #b1c9ff !important;
             }
             .fxc-popup {
+                pointer-events: auto !important;
                 position: fixed !important;
                 z-index: 2147483647 !important;
                 min-width: 230px !important;
@@ -1161,6 +1233,6 @@
                 color: #555 !important;
             }
         `;
-        document.documentElement.appendChild(style);
+        root.appendChild(style);
     }
 })();
